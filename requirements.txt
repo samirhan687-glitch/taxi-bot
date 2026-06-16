@@ -1,0 +1,5 @@
+python-telegram-bot==20.6
+faster-whisper>=0.10.0
+rapidfuzz>=3.6.0
+python-dotenv>=1.0.0
+apscheduler>=3.10.0
