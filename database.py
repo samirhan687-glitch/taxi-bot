@@ -43,6 +43,7 @@ class Database:
                 phone TEXT,
                 car_number TEXT,
                 car_model TEXT DEFAULT '',
+                car_color TEXT DEFAULT '',
                 available INTEGER DEFAULT 1,
                 rating_avg REAL DEFAULT 0.0,
                 total_rides INTEGER DEFAULT 0,
@@ -161,6 +162,49 @@ class Database:
             CREATE INDEX IF NOT EXISTS idx_referrals_referrer ON referrals(referrer_id);
         """)
 
+        # Add pending_deposits table for payment screenshot approval
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pending_deposits (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                photo_file_id TEXT,
+                status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'approved', 'rejected')),
+                amount INTEGER DEFAULT 0,
+                admin_id INTEGER,
+                admin_message_id INTEGER,
+                created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        """)
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS pending_drivers (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                phone TEXT,
+                car_number TEXT,
+                car_model TEXT,
+                car_color TEXT,
+                status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'approved', 'rejected')),
+                admin_id INTEGER,
+                created_at INTEGER DEFAULT (strftime('%s', 'now')),
+                FOREIGN KEY (user_id) REFERENCES users(user_id)
+            )
+        """)
+
+        # ─── Migrations ──────────────────────────────────────
+        # Add terminal column to drivers
+        try:
+            conn.execute("ALTER TABLE drivers ADD COLUMN terminal TEXT DEFAULT ''")
+        except Exception:
+            pass  # Column already exists
+
+        # Add terminal_board_msg_id to group_settings
+        try:
+            conn.execute("ALTER TABLE group_settings ADD COLUMN terminal_board_msg_id INTEGER DEFAULT 0")
+        except Exception:
+            pass
+
         conn.commit()
         conn.close()
 
@@ -200,17 +244,18 @@ class Database:
     # ─── Drivers ──────────────────────────────────────────────
 
     def register_driver(self, user_id: int, phone: str, car_number: str,
-                        car_model: str = "", available: int = 1):
+                        car_model: str = "", car_color: str = "", available: int = 1):
         conn = self._get_conn()
         conn.execute(
-            """INSERT INTO drivers (user_id, phone, car_number, car_model, available)
-               VALUES (?, ?, ?, ?, ?)
+            """INSERT INTO drivers (user_id, phone, car_number, car_model, car_color, available)
+               VALUES (?, ?, ?, ?, ?, ?)
                ON CONFLICT(user_id) DO UPDATE SET
                    phone = excluded.phone,
                    car_number = excluded.car_number,
-                   car_model = COALESCE(excluded.car_model, drivers.car_model)
+                   car_model = COALESCE(excluded.car_model, drivers.car_model),
+                   car_color = COALESCE(excluded.car_color, drivers.car_color)
             """,
-            (user_id, phone, car_number, car_model, available),
+            (user_id, phone, car_number, car_model, car_color, available),
         )
         conn.commit()
         conn.close()
@@ -247,6 +292,24 @@ class Database:
         conn.commit()
         conn.close()
 
+    def set_driver_terminal(self, user_id: int, terminal: str):
+        conn = self._get_conn()
+        conn.execute(
+            "UPDATE drivers SET terminal = ? WHERE user_id = ?",
+            (terminal, user_id),
+        )
+        conn.commit()
+        conn.close()
+
+    def get_terminal_drivers(self) -> list[dict]:
+        """Get all available drivers with their terminals."""
+        conn = self._get_conn()
+        rows = conn.execute(
+            "SELECT d.*, u.first_name, u.username FROM drivers d JOIN users u ON d.user_id = u.user_id WHERE d.available = 1 AND d.terminal != '' ORDER BY d.rating_avg DESC"
+        ).fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
     def get_driver(self, user_id: int) -> Optional[dict]:
         conn = self._get_conn()
         row = conn.execute(
@@ -254,6 +317,18 @@ class Database:
         ).fetchone()
         conn.close()
         return dict(row) if row else None
+
+    def remove_driver(self, user_id: int) -> bool:
+        """Remove driver role — switch back to passenger. Returns True if was a driver."""
+        conn = self._get_conn()
+        existed = conn.execute(
+            "SELECT 1 FROM drivers WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if existed:
+            conn.execute("DELETE FROM drivers WHERE user_id = ?", (user_id,))
+            conn.commit()
+        conn.close()
+        return bool(existed)
 
     def get_all_drivers(self) -> list[dict]:
         conn = self._get_conn()
@@ -696,6 +771,21 @@ class Database:
         conn.commit()
         conn.close()
 
+    def save_terminal_board_msg(self, chat_id: int, msg_id: int):
+        conn = self._get_conn()
+        conn.execute(
+            "UPDATE group_settings SET terminal_board_msg_id = ? WHERE chat_id = ?",
+            (msg_id, chat_id),
+        )
+        conn.commit()
+        conn.close()
+
+    def get_all_groups(self) -> list[dict]:
+        conn = self._get_conn()
+        rows = conn.execute("SELECT * FROM group_settings").fetchall()
+        conn.close()
+        return [dict(r) for r in rows]
+
     # ─── Spam Log ─────────────────────────────────────────────
 
     def check_spam(self, user_id: int, chat_id: int, window_seconds: int = 120, max_count: int = 3) -> bool:
@@ -865,3 +955,154 @@ class Database:
             "contacts": contacts_count,
             "spam": spam_count,
         }
+
+    # ─── Pending Deposits (Payment Screenshots) ──────────────
+
+    def create_deposit(self, user_id: int, photo_file_id: str) -> int:
+        conn = self._get_conn()
+        cursor = conn.execute(
+            """INSERT INTO pending_deposits (user_id, photo_file_id)
+               VALUES (?, ?)
+            """,
+            (user_id, photo_file_id),
+        )
+        deposit_id = cursor.lastrowid
+        conn.commit()
+        conn.close()
+        return deposit_id
+
+    def get_deposit(self, deposit_id: int) -> Optional[dict]:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT * FROM pending_deposits WHERE id = ?", (deposit_id,)
+        ).fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def approve_deposit(self, deposit_id: int, admin_id: int, amount: int) -> bool:
+        conn = self._get_conn()
+        # Check current status — prevent double approval
+        current = conn.execute(
+            "SELECT status, user_id FROM pending_deposits WHERE id = ?", (deposit_id,)
+        ).fetchone()
+        if not current or current["status"] != "pending":
+            conn.close()
+            return False
+
+        user_id = current["user_id"]
+        # Update deposit status
+        conn.execute(
+            """UPDATE pending_deposits SET status = 'approved', admin_id = ?, amount = ?
+               WHERE id = ?
+            """,
+            (admin_id, amount, deposit_id),
+        )
+        # Ensure balance row exists (same connection)
+        conn.execute(
+            """INSERT OR IGNORE INTO balances (user_id, balance) VALUES (?, 0)""",
+            (user_id,),
+        )
+        # Update balance (same connection)
+        conn.execute(
+            "UPDATE balances SET balance = balance + ?, total_earned = total_earned + ? WHERE user_id = ?",
+            (amount, amount, user_id),
+        )
+        conn.execute(
+            """INSERT INTO transactions (user_id, amount, type, description)
+                   VALUES (?, ?, ?, ?)
+                """,
+            (user_id, amount, 'credit', "Chek to'ldirish"),
+        )
+        conn.commit()
+        conn.close()
+        return True
+
+    def reject_deposit(self, deposit_id: int, admin_id: int) -> bool:
+        conn = self._get_conn()
+        current = conn.execute(
+            "SELECT status FROM pending_deposits WHERE id = ?", (deposit_id,)
+        ).fetchone()
+        if not current or current["status"] != "pending":
+            conn.close()
+            return False
+        conn.execute(
+            """UPDATE pending_deposits SET status = 'rejected', admin_id = ?
+               WHERE id = ?
+            """,
+            (admin_id, deposit_id),
+        )
+        conn.commit()
+        conn.close()
+        return True
+
+    def update_deposit_admin_msg(self, deposit_id: int, admin_message_id: int):
+        conn = self._get_conn()
+        conn.execute(
+            "UPDATE pending_deposits SET admin_message_id = ? WHERE id = ?",
+            (admin_message_id, deposit_id),
+        )
+        conn.commit()
+        conn.close()
+
+    # ─── Pending Drivers ──────────────────────────────────────
+
+    def create_pending_driver(self, user_id: int, phone: str, car_number: str, car_model: str, car_color: str) -> int:
+        conn = self._get_conn()
+        conn.execute(
+            """INSERT INTO pending_drivers (user_id, phone, car_number, car_model, car_color)
+               VALUES (?, ?, ?, ?, ?)
+            """,
+            (user_id, phone, car_number, car_model, car_color),
+        )
+        row_id = conn.execute("SELECT last_insert_rowid()").fetchone()[0]
+        conn.commit()
+        conn.close()
+        return row_id
+
+    def get_pending_driver(self, pending_id: int) -> dict | None:
+        conn = self._get_conn()
+        row = conn.execute(
+            "SELECT * FROM pending_drivers WHERE id = ?", (pending_id,)
+        ).fetchone()
+        conn.close()
+        return dict(row) if row else None
+
+    def approve_pending_driver(self, pending_id: int, admin_id: int) -> bool:
+        conn = self._get_conn()
+        current = conn.execute(
+            "SELECT * FROM pending_drivers WHERE id = ?", (pending_id,)
+        ).fetchone()
+        if not current or current["status"] != "pending":
+            conn.close()
+            return False
+        conn.execute(
+            """UPDATE pending_drivers SET status = 'approved', admin_id = ? WHERE id = ?""",
+            (admin_id, pending_id),
+        )
+        # Actually register as driver
+        conn.execute(
+            """INSERT OR REPLACE INTO drivers (user_id, phone, car_number, car_model, car_color)
+               VALUES (?, ?, ?, ?, ?)
+            """,
+            (current["user_id"], current["phone"], current["car_number"],
+             current["car_model"], current["car_color"]),
+        )
+        conn.commit()
+        conn.close()
+        return True
+
+    def reject_pending_driver(self, pending_id: int, admin_id: int) -> bool:
+        conn = self._get_conn()
+        current = conn.execute(
+            "SELECT status FROM pending_drivers WHERE id = ?", (pending_id,)
+        ).fetchone()
+        if not current or current["status"] != "pending":
+            conn.close()
+            return False
+        conn.execute(
+            """UPDATE pending_drivers SET status = 'rejected', admin_id = ? WHERE id = ?""",
+            (admin_id, pending_id),
+        )
+        conn.commit()
+        conn.close()
+        return True

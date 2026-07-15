@@ -323,9 +323,9 @@ class LocationsManager:
                     return (from_matched, to_matched)
 
         # ── Pattern B: "XdanYga" — attached suffixes (no spaces) ──
-        # e.g. "samarqanddan toshkentga" — regex on each token
+        # e.g. "samarqanddan toshkentga" or "samarqanddan → toshkentga"
         route_match = re.search(
-            r"(\w+)(dan|daman|danman)\s+(\w+)(ga|qa|nga|tomonga)?",
+            r"(\w+)(dan|daman|danman)\s*[→\->\-]?\s*(\w+)(ga|qa|nga|tomonga)?",
             text_lower,
         )
         if route_match:
